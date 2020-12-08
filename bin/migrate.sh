@@ -161,21 +161,72 @@ either manually before every invokation, or in a .env file.
             return 1
         fi
 
+        local direction=${1:-up}
+
         # shellcheck disable=2068
         find \
             ${ZC_MIGRATIONS_PATHS[@]} \
-            -name '*up.sqlite'
+            -name "*.$direction.sql" | sort -n
+    }
+
+    find_migrations_run() {
+        sqlite <<-'SQL'
+            SELECT
+                migration_path,
+                sha512256sum
+            FROM
+                migrations
+            WHERE
+                NOT is_system_migration
+            ORDER BY
+                created_at DESC,
+                migration_path DESC
+SQL
     }
 
     migrate_up() {
+        local migrations_run=() migration_path sha512256sum
+        while IFS=$'|\n' read -r migration_path sha512256sum; do
+            [ -z "$migration_path" ] && continue
+            migrations_run+=( "$migration_path" "$sha512256sum" )
+        done <<< "$(find_migrations_run)"
+
+        is_migration_run() {
+            local path i
+            for ((i=0;i<${#migrations_run[@]};i+=2)); do
+                path=${migrations_run[i]}
+                [[ "$path" == "$1" ]] && return 0
+            done
+            return 1
+        }
+
         printf -- 'Running migrations\n'
-        # echo "$__amount"
-        find_migration_files
+        for migration_path in $(find_migration_files up); do
+            if ! is_migration_run "$migration_path"; then
+                migrate_run "$migration_path" up
+            fi
+        done
     }
 
     migrate_down() {
-        printf -- 'Undoing migrations\n'
-        echo "$__amount"
+        local migrations_run=() migration_path sha512256sum
+        while IFS=$'|\n' read -r migration_path sha512256sum; do
+            [ -z "$migration_path" ] && continue
+            migrations_run+=( "$migration_path" "$sha512256sum" )
+        done <<< "$(find_migrations_run)"
+
+        if (( ${#migrations_run[@]} > 0 )); then
+            printf -- 'Undoing migrations\n'
+            local migration_path i j
+            for ((i=0,j=1;i<${#migrations_run[@]};i+=2,j++)); do
+                migration_path=${migrations_run[i]}
+                migrate_run "$migration_path" down
+                (( __amount == j )) && break
+            done
+            printf -- 'Done'
+        else
+            printf -- 'No migrations to undo\n'
+        fi
     }
 
     migrate_generate() {
@@ -187,13 +238,112 @@ either manually before every invokation, or in a .env file.
         printf -- '%s_%s.up.%s\n' "$timestamp" "$name" "$suffix"
         printf -- '%s_%s.down.%s\n' "$timestamp" "$name" "$suffix"
 
-        touch "$ZC_PROJECT_PATH/migrations/${timestamp}_${name}.up.${suffix}"
-        touch "$ZC_PROJECT_PATH/migrations/${timestamp}_${name}.down.${suffix}"
+        (tee "$ZC_PROJECT_PATH/test_migrations/${timestamp}_${name}.up.${suffix}" <<-SQL
+BEGIN;
+
+    INSERT INTO
+        authentication.users (
+            name
+        )
+    VALUES
+        (
+            '$name'
+        );
+
+COMMIT;
+SQL
+        )> /dev/null
+        (tee "$ZC_PROJECT_PATH/test_migrations/${timestamp}_${name}.down.${suffix}"  <<-SQL
+BEGIN;
+
+    DELETE FROM
+        authentication.users
+    WHERE
+        name = '$name';
+
+COMMIT;
+SQL
+        )> /dev/null
     }
 
     migrate_probe() {
         printf -- 'Probing migrations\n'
         echo "$__amount"
+    }
+
+    # shellcheck disable=2120
+    sqlite() {
+        sqlite3 --bail "$ZC_MIGRATION_DATABASE_PATH" "$@"
+    }
+
+    # shellcheck disable=2120
+    postgres() {
+        psql -v ON_ERROR_STOP=ON "$@"
+    }
+
+    sha512256() {
+        local path="$1"
+        shasum -a 512256 "$path" | cut -d ' ' -f 1
+    }
+
+    migrate_run() {
+        local migration_path=$1 sum direction="${2:-up}" is_system_migration=${3:-false}
+        sum=$(sha512256 "$migration_path")
+
+        if [[ "$direction" == "up" ]]; then
+            printf -- '%s\n' "$migration_path"
+
+            if [[ $migration_path = *.sh ]]; then
+                up() { return 0; }
+                # shellcheck disable=1090
+                source "$migration_path"
+                up
+            elif [[ $migration_path = *.sql ]]; then
+                # shellcheck disable=2119
+                postgres < "$migration_path" > /dev/null
+            fi
+
+            sqlite <<-SQL
+                INSERT INTO
+                    migrations (
+                        migration_path,
+                        sha512256sum,
+                        is_system_migration
+                    )
+                VALUES
+                    (
+                        '$migration_path',
+                        '$sum',
+                        $is_system_migration
+                    )
+SQL
+        elif [[ "$direction" == "down" ]]; then
+            printf -- '%s\n' "$migration_path"
+
+            if [[ $migration_path = *.sh ]]; then
+                down() { return 0; }
+                # shellcheck disable=1090
+                source "$migration_path"
+                down
+            elif [[ $migration_path = *.up.sql ]]; then
+                local migration_path_down
+                migration_path_down="$(dirname "$migration_path")/$(basename "$migration_path" .up.sql).down.sql"
+                [ -f "$migration_path_down" ] && postgres < "$migration_path_down" > /dev/null
+            elif [[ $migration_path = *.sql ]]; then
+                postgres < "$migration_path" > /dev/null
+            fi
+
+            sqlite <<-SQL
+                DELETE FROM
+                    migrations
+                WHERE
+                    migration_path = '$migration_path' AND
+                    sha512256sum = '$sum' AND
+                    is_system_migration = $is_system_migration
+SQL
+        else
+            return 1
+        fi
     }
 
     find_project_root() {
@@ -232,25 +382,83 @@ either manually before every invokation, or in a .env file.
     }
 
     ensure_database() {
-        local database_path="$ZC_MIGRATION_DATABASE_PATH" migrations_path
-        migrations_path="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../database")"
+        local database_path="$ZC_MIGRATION_DATABASE_PATH" migrations_path migration_path
+        migrations_path="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../database/sqlite3")"
+
         if [ ! -d "$migrations_path" ]; then
             printf -- 'Could not find migration database migrations.\n' >&2
             return 1
         fi
 
-        for m in $(find "$migrations_path" -maxdepth 1 -name '.sqlite' | sort -n); do
-            sqlite3 --bail "$database_path" < "$m"
+        if [ ! -f "$database_path" ]; then
+            printf -- 'Migration database: %s does not exist\n' "$database_path" >&2
+            if [ -t 1 ]; then
+                local answer
+                while read -p 'Would like to create it? [Y/n] ' -r answer; do
+                    if [ -z "$answer" ] || [[ "$answer" =~ [yY] ]]; then
+                        break
+                    elif [[ "$answer" =~ [nN] ]]; then
+                        return 1
+                    else
+                        printf -- '\033[1A\033[2K\r'
+                    fi
+                done
+            else
+                return 1
+            fi
+        fi
+
+        local migrations_run=()
+        if [ -s "$database_path" ]; then
+            local migrations_table_exist_result
+            migrations_table_exist_result="$(sqlite <<-'SQL'
+                SELECT
+                    1
+                FROM
+                    sqlite_master
+                WHERE
+                    type = 'table' AND
+                    name = 'migrations'
+SQL
+            )"
+            if (( migrations_table_exist_result == 1 )); then
+                local sha512256sum
+                while IFS=$'|\n' read -r migration_path sha512256sum; do
+                    migrations_run+=( "$migration_path" "$sha512256sum" )
+                done <<< "$(sqlite <<-'SQL'
+                    SELECT
+                        migration_path,
+                        sha512256sum
+                    FROM
+                        migrations
+                    WHERE
+                        is_system_migration
+SQL
+                )"
+            fi
+        fi
+
+        is_migration_run() {
+            local path i
+            for ((i=0;i<${#migrations_run[@]};i+=2)); do
+                path=${migrations_run[i]}
+                [[ "$path" == "$1" ]] && return 0
+            done
+            return 1
+        }
+
+        for migration_path in $(find "$migrations_path" -maxdepth 1 -name '*.sh' | sort -n); do
+            if ! is_migration_run "$migration_path"; then
+                migrate_run "$migration_path" "up" true > /dev/null
+            fi
         done
     }
 
     if [ -z "$ZC_PROJECT_PATH" ]; then
-        if [ -n "$PROJECT_PATH" ]; then
-            ZC_PROJECT_PATH="$PROJECT_PATH"
-        else
-            ZC_PROJECT_PATH=$(find_project_root)
-            export PROJECT_PATH=$ZC_PROJECT_PATH
+        if [ -z "$PROJECT_PATH" ]; then
+            PROJECT_PATH=$(find_project_root)
         fi
+        export ZC_PROJECT_PATH="$PROJECT_PATH"
     fi
 
     load_dotenv
@@ -261,12 +469,11 @@ either manually before every invokation, or in a .env file.
     fi
 
     if [ -z "$ZC_MIGRATION_DATABASE_PATH" ]; then
-        ZC_MIGRATION_DATABASE_PATH="$ZC_PROJECT_PATH/.migrations.db"
+        ZC_MIGRATION_DATABASE_PATH="$ZC_PROJECT_PATH/migrations.sqlite3"
         export ZC_MIGRATION_DATABASE_PATH
     fi
 
     ensure_database
-    return 0
 
     #shellcheck disable=2154
     if $generate || $g; then
