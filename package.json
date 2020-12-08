@@ -1,0 +1,28 @@
+{
+    "author": {
+        "name": "Brian Kejlberg",
+        "email": "briankchristensen@gmail.com",
+        "url": "https://github.com/thetrompf"
+    },
+    "bin": {
+        "migrate": "./bin/migrate.sh"
+    },
+    "bugs": {
+        "url": "https://github.com/zeroconf-dev/migration/issues"
+    },
+    "description": "Generic migration runner tool, for migrating databases and file systems",
+    "homepage": "https://github.com/zeroconf-dev/migration#readme",
+    "keywords": [
+        "cli",
+        "migration",
+        "runner",
+        "generic"
+    ],
+    "license": "BSD-3-Clause",
+    "name": "@zeroconf/migration",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/zeroconf-dev/migration.git"
+    },
+    "version": "1.0.0"
+}

@@ -1,0 +1,9 @@
+CREATE TABLE
+    migrations (
+        rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+        migration_path text NOT NULL UNIQUE,
+        sha256sum text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        modified_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+;
