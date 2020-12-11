@@ -8,7 +8,7 @@ up() {
             migrations (
                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
                 migration_path text NOT NULL UNIQUE,
-                sha512256sum text NOT NULL,
+                sha1sum text NOT NULL,
                 is_system_migration boolean NOT NULL DEFAULT false,
                 created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
