@@ -1,0 +1,6 @@
+/.env
+/.gitignore
+/.vscode/
+/migrations.sqlite3
+/migrations/
+/test_migrations/
