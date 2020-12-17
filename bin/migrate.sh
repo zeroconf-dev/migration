@@ -194,7 +194,6 @@ SQL
     }
 
     verify() {
-        set -x
         local migration_path=$1 sha1sum=$2 sum
         sum=$(sha1 "$migration_path")
         if [[ "$sum" != "$sha1sum" ]]; then
@@ -204,7 +203,6 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
             # shellcheck disable=2154
             $__paranoia && return 1
         fi
-        set +x
         return 0
     }
 
@@ -212,6 +210,7 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
         local migrations_missing=() migrations_run=() \
               migration_path sha1sum sum wait_pids=()
         printf -- 'Sanity checking already run migrations.\n'
+
         while IFS=$'|\n' read -r migration_path sha1sum; do
             [ -z "$migration_path" ] && continue
             if [ ! -f "$migration_path" ]; then
@@ -223,11 +222,10 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
                 migrations_run+=( "$migration_path" "$sha1sum" )
             fi
         done <<< "$(find_migrations_run)"
-        set -x
+
         if (( "${#wait_pids[@]}" > 0 )); then
             wait "${wait_pids[@]}"
         fi
-        set +x
 
         is_migration_run() {
             local path i
@@ -320,7 +318,20 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
 
     # shellcheck disable=2120
     postgres() {
-        psql -v ON_ERROR_STOP=ON "$@"
+        if [ -z "$1" ]; then
+            cat - >&5
+            printf -- ';SELECT E'\''\04'\'';\n' >&5
+        else
+            printf -- '%s;SELECT E'\''\04'\'';\n' "$1" >&5
+        fi
+
+        local row
+        while IFS=$'\n' read -u 6 -t 1 -r row; do
+            [ "$row" = $'\x04' ] && break
+            printf -- '%s\n' "$row"
+        done
+
+        return 0
     }
 
     sha1() {
@@ -340,6 +351,9 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
                 # shellcheck disable=1090
                 source "$migration_path"
                 up
+            elif [[ $migration_path = *.up.sql ]]; then
+                # shellcheck disable=2119
+                postgres < "$migration_path" > /dev/null
             elif [[ $migration_path = *.sql ]]; then
                 # shellcheck disable=2119
                 postgres < "$migration_path" > /dev/null
@@ -527,12 +541,19 @@ SQL
         return 0
     fi
 
-    local fifo
-    fifo=$(mktemp -up/tmp P.zc_migration.XXX)
-    mkfifo --mode=0700 "$fifo.in" "$fifo.out"
-    trap "rm ""$fifo.out"" ""$fifo.in""" EXIT
-    sqlite3 --bail "$ZC_MIGRATION_DATABASE_PATH" <"$fifo.in" >"$fifo.out" &
-    exec 3> "$fifo.in" 4< "$fifo.out"
+    local sqlite_fifo
+    sqlite_fifo=$(mktemp -up/tmp P.zc_migration.XXX)
+    mkfifo --mode=0700 "$sqlite_fifo.in" "$sqlite_fifo.out"
+    trap "rm ""$sqlite_fifo.in"" ""$sqlite_fifo.out""" EXIT
+    sqlite3 --bail "$ZC_MIGRATION_DATABASE_PATH" <"$sqlite_fifo.in" >"$sqlite_fifo.out" &
+    exec 3> "$sqlite_fifo.in" 4< "$sqlite_fifo.out"
+
+    local postgres_fifo
+    postgres_fifo=$(mktemp -up/tmp P.zc_migration.XXX)
+    mkfifo --mode=0700 "$postgres_fifo.in" "$postgres_fifo.out"
+    trap "rm ""$postgres_fifo.in"" ""$postgres_fifo.out""" EXIT
+    psql -v ON_ERROR_STOP=ON -F '|' -R $'\n' -A -t -q <"$postgres_fifo.in" >"$postgres_fifo.out" &
+    exec 5> "$postgres_fifo.in" 6< "$postgres_fifo.out"
 
     ensure_database
 
