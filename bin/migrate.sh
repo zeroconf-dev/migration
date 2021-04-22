@@ -159,6 +159,7 @@ declare -p "${prefix}__template" "${prefix}__paranoia" "${prefix}__amount" \
 "${prefix}probe" "${prefix}up"; done; }
 # docopt parser above, complete command for generating this parser is `docopt.sh migrate.sh`
     eval "$(docopt "$@")"
+    local migration_table_name=migrations
 
     find_migration_files() {
         if [[ ! ${#ZC_MIGRATIONS_PATHS[@]} ]]; then
@@ -169,26 +170,25 @@ either manually before every invokation, or in a .env file.
             return 1
         fi
 
-        local direction=${1:-up}
-
         # shellcheck disable=2068
         find \
             ${ZC_MIGRATIONS_PATHS[@]} \
-            \( -name "*.$direction.sql" -o -name "*.$direction.sqlite" \) \
+            \( -name "*.sql" -o -name "*.sqlite" \) \
+            -not \( -name "*.down.sql" -name "*.down.sqlite" \) \
         | sort -V
     }
 
     find_migrations_run() {
-        sqlite <<-'SQL'
+        $ZC_MIGRATION_ENGINE <<-SQL
             SELECT
                 migration_path,
                 sha1sum
             FROM
-                migrations
+                $migration_table_name
             WHERE
                 NOT is_system_migration
             ORDER BY
-                created_at DESC,
+                run_at DESC,
                 migration_path DESC
 SQL
     }
@@ -215,11 +215,11 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
             [ -z "$migration_path" ] && continue
             if [ ! -f "$migration_path" ]; then
                 # printf -- 'Migration not found: %s\n' "$migration_path" >&2
-                migrations_missing+=( "$migration_path" )
+                migrations_missing+=( "${ZC_PROJECT_PATH}/${migration_path}" )
             else
-                verify "$migration_path" "$sha1sum" "$sum" &
+                verify "${ZC_PROJECT_PATH}/${migration_path}" "$sha1sum" "$sum" &
                 wait_pids+=( $! )
-                migrations_run+=( "$migration_path" "$sha1sum" )
+                migrations_run+=( "${ZC_PROJECT_PATH}/${migration_path}" "$sha1sum" )
             fi
         done <<< "$(find_migrations_run)"
 
@@ -249,7 +249,7 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
         local migrations_run=() migration_path sha1sum
         while IFS=$'|\n' read -r migration_path sha1sum; do
             [ -z "$migration_path" ] && continue
-            migrations_run+=( "$migration_path" "$sha1sum" )
+            migrations_run+=( "${ZC_PROJECT_PATH}/${migration_path}" "$sha1sum" )
         done <<< "$(find_migrations_run)"
 
         if (( ${#migrations_run[@]} > 0 )); then
@@ -270,7 +270,7 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
         # shellcheck disable=2153,2154
         local name="$NAME" relpath suffix='sql' timestamp
         timestamp="$(date +%Y%m%d%H%M%S)"
-        relpath="$(realpath --relative-to="$(pwd)" "$ZC_PROJECT_PATH/test_migrations")"
+        relpath="$(realpath --relative-to="$(pwd)" "$ZC_PROJECT_PATH/migrations")"
 
         printf -- 'Generating migrations\n'
 
@@ -281,17 +281,13 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
                 return 1
             fi
 
-            printf -- '%s/%s_%s_%s.up.%s\n' "$relpath" "$timestamp" "$__template" "$name" "$suffix"
-            printf -- '%s/%s_%s_%s.down.%s\n' "$relpath" "$timestamp" "$__template" "$name" "$suffix"
-            (sed -e "s/{TIMESTAMP}/$timestamp/g" -e "s/{NAME}/$NAME/g" -e "s/{DIRECTION}/up/g" < "$ZC_MIGRATION_LIB/templates/$__template"*) > "$ZC_PROJECT_PATH/test_migrations/${timestamp}_${__template}_${name}.up.${suffix}"
-            (sed -e "s/{TIMESTAMP}/$timestamp/g" -e "s/{NAME}/$NAME/g" -e "s/{DIRECTION}/down/g" < "$ZC_MIGRATION_LIB/templates/$__template"*) > "$ZC_PROJECT_PATH/test_migrations/${timestamp}_${__template}_${name}.down.${suffix}"
+            printf -- '%s/%s_%s_%s.%s\n' "$relpath" "$timestamp" "$__template" "$name" "$suffix"
+            (sed -e "s/{TIMESTAMP}/$timestamp/g" -e "s/{NAME}/$NAME/g" < "$ZC_MIGRATION_LIB/templates/$__template"*) > "$ZC_PROJECT_PATH/migrations/${timestamp}_${__template}_${name}.${suffix}"
             return 0
         fi
 
-        printf -- '%s_%s.up.%s\n' "$timestamp" "$name" "$suffix"
-        printf -- '%s_%s.down.%s\n' "$timestamp" "$name" "$suffix"
-        touch "$ZC_PROJECT_PATH/test_migrations/${timestamp}_${name}.up.${suffix}"
-        touch "$ZC_PROJECT_PATH/test_migrations/${timestamp}_${name}.down.${suffix}"
+        printf -- '%s_%s.%s\n' "$timestamp" "$name" "$suffix"
+        touch "$ZC_PROJECT_PATH/migrations/${timestamp}_${name}.${suffix}"
     }
 
     migrate_probe() {
@@ -340,7 +336,8 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
     }
 
     migrate_run() {
-        local migration_path=$1 sum direction="${2:-up}" is_system_migration=${3:-false}
+        local migration_path sum direction="${2:-up}" is_system_migration=${3:-false}
+        migration_path=$(realpath --relative-to="$ZC_PROJECT_PATH" "$1")
         sum=$(sha1 "$migration_path")
 
         if [[ "$direction" == "up" ]]; then
@@ -356,14 +353,18 @@ Filesystem: %s\n' "$migration_path" "$sha1sum" "$sum" >&2
                 postgres < "$migration_path" > /dev/null
             elif [[ $migration_path = *.sql ]]; then
                 # shellcheck disable=2119
-                postgres < "$migration_path" > /dev/null
+                postgres < <(sed -n '/^-- MIGRATE UP BEGIN/,${p;/^-- MIGRATE UP END/q}' "$migration_path") > /dev/null
             elif [[ $migration_path = "*.sqlite" ]]; then
                 sqlite < "$migration_path" > /dev/null
             fi
 
-            sqlite <<-SQL
+            if $is_system_migration; then
+                migration_path=$(basename "$migration_path")
+            fi
+
+            $ZC_MIGRATION_ENGINE <<-SQL
                 INSERT INTO
-                    migrations (
+                    $migration_table_name (
                         migration_path,
                         sha1sum,
                         is_system_migration
@@ -388,15 +389,14 @@ SQL
                 migration_path_down="$(dirname "$migration_path")/$(basename "$migration_path" .up.sql).down.sql"
                 [ -f "$migration_path_down" ] && postgres < "$migration_path_down" > /dev/null
             elif [[ $migration_path = *.sql ]]; then
-                postgres < "$migration_path" > /dev/null
+                postgres < <(sed -n '/^-- MIGRATE DOWN BEGIN/,${p;/^-- MIGRATE DOWN END/q}' "$migration_path") > /dev/null
             fi
 
-            sqlite <<-SQL
+            $ZC_MIGRATION_ENGINE <<-SQL
                 DELETE FROM
-                    migrations
+                    $migration_table_name
                 WHERE
                     migration_path = '$migration_path' AND
-                    sha1sum = '$sum' AND
                     is_system_migration = $is_system_migration
 SQL
         else
@@ -430,13 +430,18 @@ SQL
             read_dotenv_file "$ZC_PROJECT_PATH/.config/.env"
         fi
 
-        ZC_MIGRATION_LIB="$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")"
+        ZC_MIGRATION_LIB="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.."
         export ZC_MIGRATION_LIB
 
         if [ -z "$ZC_MIGRATIONS_PATHS" ]; then
             ZC_MIGRATIONS_PATHS=()
             [ -d "$ZC_PROJECT_PATH/migrations" ] && ZC_MIGRATIONS_PATHS+=( "$ZC_PROJECT_PATH/migrations" )
             export ZC_MIGRATIONS_PATHS
+        fi
+
+        if [ -z "$ZC_MIGRATION_ENGINE" ]; then
+            ZC_MIGRATION_ENGINE=sqlite
+            export ZC_MIGRATION_ENGINE
         fi
 
         if [ -z "$ZC_MIGRATION_DATABASE_PATH" ]; then
@@ -455,59 +460,73 @@ SQL
 
     ensure_database() {
         local database_path="$ZC_MIGRATION_DATABASE_PATH" migrations_path migration_path
-        migrations_path="$ZC_MIGRATION_LIB/database/sqlite3"
+        migrations_path="$ZC_MIGRATION_LIB/engine/$ZC_MIGRATION_ENGINE"
 
         if [ ! -d "$migrations_path" ]; then
             printf -- 'Could not find migration database migrations.\n' >&2
             return 1
         fi
 
-        if [ ! -f "$database_path" ]; then
-            printf -- 'Migration database: %s does not exist\n' "$database_path" >&2
-            if [ -t 1 ]; then
-                local answer
-                while read -p 'Would like to create it? [Y/n] ' -r answer; do
-                    if [ -z "$answer" ] || [[ "$answer" =~ [yY] ]]; then
-                        break
-                    elif [[ "$answer" =~ [nN] ]]; then
-                        return 1
-                    else
-                        printf -- '\033[1A\033[2K\r'
-                    fi
-                done
-            else
-                return 1
-            fi
-        fi
-
         local migrations_run=()
-        if [ -s "$database_path" ]; then
-            local migrations_table_exist_result
-            migrations_table_exist_result="$(sqlite <<-'SQL'
+        local migrations_table_exist_result
+        if [ "$ZC_MIGRATION_ENGINE" = postgres ]; then
+            migrations_table_exist_result="$(postgres <<-'SQL'
                 SELECT
                     1
                 FROM
-                    sqlite_master
+                    information_schema.tables
                 WHERE
-                    type = 'table' AND
-                    name = 'migrations'
+                    table_schema = 'migration' AND
+                    table_name = 'migrations'
 SQL
             )"
-            if (( migrations_table_exist_result == 1 )); then
-                local sha1sum
-                while IFS=$'|\n' read -r migration_path sha1sum; do
-                    migrations_run+=( "$migration_path" "$sha1sum" )
-                done <<< "$(sqlite <<-'SQL'
+        elif [ "$ZC_MIGRATION_ENGINE" = sqlite ]; then
+            if [ ! -f "$database_path" ]; then
+                printf -- 'Migration database: %s does not exist\n' "$database_path" >&2
+                if [ -t 1 ]; then
+                    local answer
+                    while read -p 'Would like to create it? [Y/n] ' -r answer; do
+                        if [ -z "$answer" ] || [[ "$answer" =~ [yY] ]]; then
+                            break
+                        elif [[ "$answer" =~ [nN] ]]; then
+                            return 1
+                        else
+                            printf -- '\033[1A\033[2K\r'
+                        fi
+                    done
+                else
+                    return 1
+                fi
+            fi
+
+            if [ -s "$database_path" ]; then
+                migrations_table_exist_result="$(sqlite <<-'SQL'
                     SELECT
-                        migration_path,
-                        sha1sum
+                        1
                     FROM
-                        migrations
+                        sqlite_master
                     WHERE
-                        is_system_migration
+                        type = 'table' AND
+                        name = 'migrations'
 SQL
                 )"
             fi
+        fi
+
+        if (( migrations_table_exist_result == 1 )); then
+            local sha1sum
+            while IFS=$'|\n' read -r migration_path sha1sum; do
+                migrations_run+=( "$migration_path" "$sha1sum" )
+            done <<< "$($ZC_MIGRATION_ENGINE <<-SQL
+                SELECT
+                    migration_path,
+                    sha1sum
+                FROM
+                    $migration_table_name
+                WHERE
+                    is_system_migration
+SQL
+            )"
         fi
 
         is_migration_run() {
@@ -519,8 +538,8 @@ SQL
             return 1
         }
 
-        for migration_path in $(find "$migrations_path" -maxdepth 1 -name '*.sh' | sort -V); do
-            if ! is_migration_run "$migration_path"; then
+        for migration_path in $(find "$migrations_path" -maxdepth 1 -name '*.sh' -o -name '*.sql' | sort -V); do
+            if ! is_migration_run "$(basename "$migration_path")"; then
                 migrate_run "$migration_path" "up" true > /dev/null
             fi
         done
@@ -541,6 +560,10 @@ SQL
         return 0
     fi
 
+    if [ "$ZC_MIGRATION_ENGINE" = postgres ]; then
+        migration_table_name='migration.migrations';
+    fi
+
     local sqlite_fifo
     sqlite_fifo=$(mktemp -up/tmp P.zc_migration.XXX)
     mkfifo --mode=0700 "$sqlite_fifo.in" "$sqlite_fifo.out"
@@ -552,7 +575,7 @@ SQL
     postgres_fifo=$(mktemp -up/tmp P.zc_migration.XXX)
     mkfifo --mode=0700 "$postgres_fifo.in" "$postgres_fifo.out"
     trap "rm ""$postgres_fifo.in"" ""$postgres_fifo.out""" EXIT
-    psql -v ON_ERROR_STOP=ON -F '|' -R $'\n' -A -t -q <"$postgres_fifo.in" >"$postgres_fifo.out" &
+    psql -v ON_ERROR_STOP=1 -F '|' -R $'\n' -A -t -q <"$postgres_fifo.in" >"$postgres_fifo.out" &
     exec 5> "$postgres_fifo.in" 6< "$postgres_fifo.out"
 
     ensure_database
